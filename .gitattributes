@@ -1,0 +1,9 @@
+# Normalize text files to LF line endings.
+* text=auto eol=lf
+
+# Exclude everything from generated repository archives by default.
+/** export-ignore
+
+# Include the complete add-on directory.
+/addons !export-ignore
+/addons/** !export-ignore
