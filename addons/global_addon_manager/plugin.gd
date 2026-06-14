@@ -78,7 +78,6 @@ var pending_addon_folder := ""
 var editor_file_system: EditorFileSystem
 var filesystem_refresh_queued := false
 var resource_import_in_progress := false
-var manual_refresh_requested := false
 
 var addon_type_cache: Dictionary = {}
 var gdextension_path_cache: Dictionary = {}
@@ -105,6 +104,9 @@ func _enter_tree() -> void:
 
 
 func _exit_tree() -> void:
+	filesystem_refresh_queued = false
+	resource_import_in_progress = false
+
 	_disconnect_editor_filesystem()
 
 	if is_instance_valid(main_panel):
@@ -238,36 +240,24 @@ func _queue_filesystem_refresh() -> void:
 		return
 
 	filesystem_refresh_queued = true
-	call_deferred("_refresh_after_filesystem_change")
+	call_deferred("_perform_queued_filesystem_refresh")
 
 
-func _refresh_after_filesystem_change() -> void:
-	if not is_instance_valid(main_panel):
-		filesystem_refresh_queued = false
-		manual_refresh_requested = false
-		return
-
-	var filesystem := EditorInterface.get_resource_filesystem()
-
-	if filesystem == null:
-		filesystem_refresh_queued = false
-		_refresh_all(false)
-		_report_manual_refresh_if_requested()
-		return
-
-	if filesystem.is_scanning() or resource_import_in_progress:
-		await get_tree().create_timer(0.2).timeout
-		call_deferred("_refresh_after_filesystem_change")
-		return
-
+func _perform_queued_filesystem_refresh() -> void:
+	# Clear this first. Refreshing may indirectly cause another filesystem
+	# notification, which should be allowed to queue another refresh.
 	filesystem_refresh_queued = false
 
+	if not is_instance_valid(main_panel):
+		return
+
 	var previous_project_count := project_addon_count
+
+	# These lists use DirAccess directly, so they do not need to wait
+	# for EditorFileSystem.scan() to finish.
 	_refresh_all(false)
 
-	if manual_refresh_requested:
-		_report_manual_refresh_if_requested()
-	elif (
+	if (
 		main_panel.visible
 		and project_addon_count > previous_project_count
 	):
@@ -277,12 +267,30 @@ func _refresh_after_filesystem_change() -> void:
 		)
 
 
-func _report_manual_refresh_if_requested() -> void:
-	if not manual_refresh_requested:
+func _request_editor_filesystem_scan() -> void:
+	# Do not keep a persistent pending state. A deferred, best-effort scan
+	# avoids re-entering the current file operation and cannot become stuck
+	# if this @tool script is reloaded.
+	call_deferred("_perform_requested_editor_filesystem_scan")
+
+
+func _perform_requested_editor_filesystem_scan() -> void:
+	var filesystem := editor_file_system
+
+	if not is_instance_valid(filesystem):
+		filesystem = EditorInterface.get_resource_filesystem()
+		editor_file_system = filesystem
+
+	if filesystem == null:
 		return
 
-	manual_refresh_requested = false
-	_set_status(_get_refresh_summary_text())
+	# The plugin's own lists have already been refreshed through DirAccess.
+	# If Godot is busy, let the active scan/import finish instead of starting
+	# a second scan or keeping a request that can remain locked after reload.
+	if resource_import_in_progress or filesystem.is_scanning():
+		return
+
+	filesystem.scan()
 
 
 # ==============================================================================
@@ -981,20 +989,13 @@ func _addon_matches_search(
 
 
 func _refresh_addons() -> void:
-	manual_refresh_requested = true
+	# Refresh the plugin UI immediately. Both the project and global
+	# library are read directly through DirAccess.
+	_refresh_all(true)
 
-	var filesystem := EditorInterface.get_resource_filesystem()
-
-	if filesystem == null:
-		_refresh_all(false)
-		_report_manual_refresh_if_requested()
-		return
-
-	if not filesystem.is_scanning() and not resource_import_in_progress:
-		filesystem.scan()
-
-	_queue_filesystem_refresh()
-	_set_status("Scanning project addons and the global library...")
+	# Separately ask Godot to update its own FileSystem dock and
+	# resource database.
+	_request_editor_filesystem_scan()
 
 
 func _refresh_all(report_status: bool) -> void:
@@ -2262,17 +2263,7 @@ func _get_project_addon_absolute_path(
 
 
 func _scan_editor_filesystem() -> void:
-	var filesystem := EditorInterface.get_resource_filesystem()
-
-	if filesystem == null:
-		return
-
-	if filesystem.is_scanning() or resource_import_in_progress:
-		_queue_filesystem_refresh()
-		return
-
-	filesystem.scan()
-	_queue_filesystem_refresh()
+	_request_editor_filesystem_scan()
 
 
 # ==============================================================================
