@@ -18,6 +18,12 @@ enum AddonType {
 }
 
 
+enum SourceType {
+	DIR,
+	ZIP,
+}
+
+
 const LEGACY_CONFIG_PATH := "user://global_addon_manager.cfg"
 const CONFIG_DIRECTORY_NAME := "Godot"
 const CONFIG_FILE_NAME := "global_addon_manager.cfg"
@@ -27,8 +33,13 @@ const CONFIG_KEY_GLOBAL_PATH := "global_addons_path"
 const PROJECT_ADDONS_RES := "res://addons"
 const SELF_ADDON_FOLDER := "global_addon_manager"
 const MAX_GDEXTENSION_SEARCH_DEPTH := 8
+const MAX_ADDON_ROOT_SEARCH_DEPTH := 6
+const ZIP_EXTENSION := "zip"
+const GIT_DIRECTORY_NAME := ".git"
+const GIT_CONFIG_FILE_NAME := "config"
+const CONTEXT_MENU_ID_OPEN_GIT_URL := 0
 
-const GDEXTENSION_SEARCH_IGNORED_FOLDERS := [
+const ADDON_SEARCH_IGNORED_FOLDERS := [
 	"example",
 	"examples",
 	"demo",
@@ -50,6 +61,7 @@ var global_details_label: Label
 var global_count_label: Label
 var global_install_button: Button
 var global_update_project_button: Button
+var global_git_pull_button: Button
 
 var project_search_edit: LineEdit
 var project_addon_list: ItemList
@@ -64,16 +76,20 @@ var status_label: Label
 
 var folder_dialog: FileDialog
 var confirmation_dialog: ConfirmationDialog
+var item_context_menu: PopupMenu
+var context_menu_git_url := ""
 
-var selected_global_addon_folder := ""
+var selected_global_addon_entry: Dictionary = {}
 var selected_project_addon_folder := ""
 var last_saved_global_path := ""
 
 var global_addon_count := 0
 var project_addon_count := 0
+var global_addon_entries: Array[Dictionary] = []
 
 var pending_action := PendingAction.NONE
 var pending_addon_folder := ""
+var pending_global_entry: Dictionary = {}
 
 var editor_file_system: EditorFileSystem
 var filesystem_refresh_queued := false
@@ -441,6 +457,17 @@ func _build_global_panel(parent: HSplitContainer) -> void:
 	global_count_label.text = "0 items"
 	heading_row.add_child(global_count_label)
 
+	global_git_pull_button = Button.new()
+	global_git_pull_button.text = "Pull Git Addons"
+	global_git_pull_button.tooltip_text = (
+		"Runs 'git pull --ff-only' on every global addon that is a git "
+		+ "checkout, then reports which ones fetched a newer version."
+	)
+	global_git_pull_button.pressed.connect(
+		_pull_all_global_git_addons
+	)
+	heading_row.add_child(global_git_pull_button)
+
 	global_search_edit = LineEdit.new()
 	global_search_edit.placeholder_text = "Search global addons..."
 	global_search_edit.clear_button_enabled = true
@@ -460,6 +487,9 @@ func _build_global_panel(parent: HSplitContainer) -> void:
 	global_addon_list.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	global_addon_list.item_selected.connect(
 		_on_global_addon_selected
+	)
+	global_addon_list.item_clicked.connect(
+		_on_global_addon_item_clicked
 	)
 	global_list_frame.add_child(global_addon_list)
 
@@ -530,6 +560,9 @@ func _build_project_panel(parent: HSplitContainer) -> void:
 	project_addon_list.size_flags_vertical = Control.SIZE_EXPAND_FILL
 	project_addon_list.item_selected.connect(
 		_on_project_addon_selected
+	)
+	project_addon_list.item_clicked.connect(
+		_on_project_addon_item_clicked
 	)
 	project_list_frame.add_child(project_addon_list)
 
@@ -619,6 +652,16 @@ func _build_dialogs() -> void:
 		_clear_pending_action
 	)
 	main_panel.add_child(confirmation_dialog)
+
+	item_context_menu = PopupMenu.new()
+	item_context_menu.add_item(
+		"Open Git Repository",
+		CONTEXT_MENU_ID_OPEN_GIT_URL
+	)
+	item_context_menu.id_pressed.connect(
+		_on_item_context_menu_id_pressed
+	)
+	main_panel.add_child(item_context_menu)
 
 
 func _create_list_frame(parent: Control) -> MarginContainer:
@@ -888,7 +931,7 @@ func _save_config() -> void:
 
 	last_saved_global_path = candidate_path
 	global_path_edit.text = candidate_path
-	selected_global_addon_folder = ""
+	selected_global_addon_entry = {}
 
 	_refresh_all(false)
 
@@ -947,8 +990,8 @@ func _on_project_search_changed(_new_text: String) -> void:
 
 
 func _on_global_addon_selected(index: int) -> void:
-	selected_global_addon_folder = str(
-		global_addon_list.get_item_metadata(index)
+	selected_global_addon_entry = global_addon_list.get_item_metadata(
+		index
 	)
 	_update_action_states()
 
@@ -958,6 +1001,59 @@ func _on_project_addon_selected(index: int) -> void:
 		project_addon_list.get_item_metadata(index)
 	)
 	_update_action_states()
+
+
+func _on_global_addon_item_clicked(
+	index: int,
+	_at_position: Vector2,
+	mouse_button_index: int
+) -> void:
+	if mouse_button_index != MOUSE_BUTTON_RIGHT:
+		return
+
+	global_addon_list.select(index, true)
+	_on_global_addon_selected(index)
+
+	var entry: Dictionary = global_addon_list.get_item_metadata(index)
+	_open_item_context_menu(str(entry.get("git_remote_url", "")))
+
+
+func _on_project_addon_item_clicked(
+	index: int,
+	_at_position: Vector2,
+	mouse_button_index: int
+) -> void:
+	if mouse_button_index != MOUSE_BUTTON_RIGHT:
+		return
+
+	project_addon_list.select(index, true)
+	_on_project_addon_selected(index)
+
+	var addon_folder := str(project_addon_list.get_item_metadata(index))
+	var addon_path := _get_project_addon_absolute_path(addon_folder)
+	_open_item_context_menu(_read_git_remote_url(addon_path))
+
+
+func _open_item_context_menu(git_remote_url: String) -> void:
+	context_menu_git_url = git_remote_url
+	item_context_menu.set_item_disabled(
+		item_context_menu.get_item_index(CONTEXT_MENU_ID_OPEN_GIT_URL),
+		git_remote_url == ""
+	)
+	item_context_menu.position = DisplayServer.mouse_get_position()
+	item_context_menu.popup()
+
+
+func _on_item_context_menu_id_pressed(id: int) -> void:
+	if id != CONTEXT_MENU_ID_OPEN_GIT_URL or context_menu_git_url == "":
+		return
+
+	var browser_url := _convert_git_url_to_browser_url(
+		context_menu_git_url
+	)
+
+	if browser_url != "":
+		OS.shell_open(browser_url)
 
 
 func _addon_matches_search(
@@ -1031,43 +1127,45 @@ func _refresh_global_addon_list() -> void:
 		global_path == ""
 		or not DirAccess.dir_exists_absolute(global_path)
 	):
-		selected_global_addon_folder = ""
+		selected_global_addon_entry = {}
+		global_addon_entries = []
 		global_count_label.text = "Unavailable"
 		return
 
-	var addon_folders := _collect_addon_folders(global_path)
-	global_addon_count = addon_folders.size()
+	global_addon_entries = _collect_global_addon_entries(global_path)
+	global_addon_count = global_addon_entries.size()
 
 	var selected_item_found := false
 	var visible_count := 0
 
-	for addon_folder in addon_folders:
-		var addon_path := global_path.path_join(addon_folder)
-
-		if not _addon_matches_search(
-			addon_path,
-			addon_folder,
+	for entry in global_addon_entries:
+		if not _global_entry_matches_search(
+			entry,
 			global_search_edit.text
 		):
 			continue
 
 		var index := global_addon_list.get_item_count()
 		global_addon_list.add_item(
-			_get_global_addon_display_text(
-				addon_path,
-				addon_folder
-			)
+			_get_global_addon_display_text(entry)
 		)
-		global_addon_list.set_item_metadata(index, addon_folder)
+		global_addon_list.set_item_metadata(index, entry)
+		global_addon_list.set_item_tooltip(
+			index,
+			_get_global_addon_tooltip_text(entry)
+		)
 		visible_count += 1
 
-		if addon_folder == selected_global_addon_folder:
+		if (
+			not selected_global_addon_entry.is_empty()
+			and entry.id == selected_global_addon_entry.id
+		):
 			global_addon_list.select(index, true)
 			global_addon_list.ensure_current_is_visible()
 			selected_item_found = true
 
 	if not selected_item_found:
-		selected_global_addon_folder = ""
+		selected_global_addon_entry = {}
 
 	global_count_label.text = _format_visible_count(
 		visible_count,
@@ -1110,6 +1208,10 @@ func _refresh_project_addon_list() -> void:
 			)
 		)
 		project_addon_list.set_item_metadata(index, addon_folder)
+		project_addon_list.set_item_tooltip(
+			index,
+			_get_project_addon_tooltip_text(addon_path)
+		)
 		visible_count += 1
 
 		if addon_folder == selected_project_addon_folder:
@@ -1164,7 +1266,7 @@ func _update_action_states() -> void:
 
 
 func _update_global_action_states() -> void:
-	if selected_global_addon_folder == "":
+	if selected_global_addon_entry.is_empty():
 		global_details_label.text = (
 			"Select a global addon to install or update it."
 		)
@@ -1172,12 +1274,9 @@ func _update_global_action_states() -> void:
 		global_update_project_button.disabled = true
 		return
 
-	var addon_folder := selected_global_addon_folder
-	var global_addon_path := _get_global_path().path_join(
-		addon_folder
-	)
-	var global_addon_type := _get_addon_type(global_addon_path)
-	var type_label := _get_addon_type_label(global_addon_type)
+	var entry := selected_global_addon_entry
+	var addon_folder: String = entry.target_folder_name
+	var type_label := _get_addon_type_label(int(entry.type))
 	var is_in_project := _is_project_addon_installed(addon_folder)
 	var project_addon_type := AddonType.UNKNOWN
 	var project_plugin_is_enabled := false
@@ -1192,8 +1291,10 @@ func _update_global_action_states() -> void:
 				EditorInterface.is_plugin_enabled(addon_folder)
 			)
 
+	var status_text := ""
+
 	if not is_in_project:
-		global_details_label.text = (
+		status_text = (
 			"%s is a %s available only in the global library."
 			% [addon_folder, type_label]
 		)
@@ -1201,19 +1302,24 @@ func _update_global_action_states() -> void:
 		var state_text := (
 			"enabled" if project_plugin_is_enabled else "disabled"
 		)
-		global_details_label.text = (
+		status_text = (
 			(
 				"%s is a %s installed in this project; its editor "
 				+ "plugin is %s."
 			) % [addon_folder, type_label, state_text]
 		)
 	else:
-		global_details_label.text = (
+		status_text = (
 			(
 				"%s is a GDExtension installed in this project. "
 				+ "It has no editor-plugin toggle."
 			) % addon_folder
 		)
+
+	if entry.description != "":
+		status_text += "\n\n%s" % entry.description
+
+	global_details_label.text = status_text
 
 	global_install_button.disabled = is_in_project
 	global_update_project_button.disabled = (
@@ -1290,20 +1396,16 @@ func _format_visible_count(
 	return "%d of %d" % [visible_count, total_count]
 
 
-func _get_global_addon_display_text(
-	addon_path: String,
-	addon_folder: String
-) -> String:
-	var display_name := _get_addon_display_name(
-		addon_path,
-		addon_folder
-	)
-	var type_label := _get_addon_type_label(
-		_get_addon_type(addon_path)
-	)
+func _get_global_addon_display_text(entry: Dictionary) -> String:
+	var display_name := _get_entry_display_name(entry)
+	var type_label := _get_addon_type_label(int(entry.type))
+
+	if entry.source_type == SourceType.ZIP:
+		type_label += " (zip)"
+
 	var location_label := (
 		"In project"
-		if _is_project_addon_installed(addon_folder)
+		if _is_project_addon_installed(entry.target_folder_name)
 		else "Global only"
 	)
 
@@ -1312,6 +1414,39 @@ func _get_global_addon_display_text(
 		type_label,
 		location_label,
 	]
+
+
+func _get_entry_display_name(entry: Dictionary) -> String:
+	var plugin_name: String = (
+		entry.name if entry.name != "" else entry.target_folder_name
+	)
+
+	if entry.version == "":
+		return plugin_name
+
+	return "%s  v%s" % [plugin_name, entry.version]
+
+
+func _global_entry_matches_search(
+	entry: Dictionary,
+	search_text: String
+) -> bool:
+	var normalized_search := search_text.strip_edges().to_lower()
+
+	if normalized_search == "":
+		return true
+
+	var searchable_text := (
+		str(entry.target_folder_name)
+		+ " "
+		+ str(entry.name)
+		+ " "
+		+ str(entry.version)
+		+ " "
+		+ _get_addon_type_label(int(entry.type))
+	).to_lower()
+
+	return searchable_text.contains(normalized_search)
 
 
 func _get_project_addon_display_text(
@@ -1348,6 +1483,725 @@ func _get_project_addon_display_text(
 		type_label,
 		global_label,
 	]
+
+
+# ==============================================================================
+# Global library addon discovery
+# ==============================================================================
+#
+# Each top-level entry of the global library (a folder or a .zip file) may:
+#   - be the addon itself (plugin.cfg / *.gdextension directly inside it), or
+#   - bundle the real addon(s) nested somewhere inside it, e.g. a GitHub
+#     archive extracted as "RepoName-main/addons/my_addon/plugin.cfg".
+#
+# This section walks each top-level entry looking for addon roots (recursing
+# through real directories, or scanning the file list of a .zip archive),
+# builds one descriptor Dictionary per addon root found, and then keeps only
+# the newest version of each addon name (compared via plugin.cfg "version").
+
+
+func _collect_global_addon_entries(
+	global_path: String
+) -> Array[Dictionary]:
+	var raw_entries: Array[Dictionary] = []
+	var dir := DirAccess.open(global_path)
+
+	if dir == null:
+		return raw_entries
+
+	dir.list_dir_begin()
+	var entry_name := dir.get_next()
+
+	while entry_name != "":
+		if (
+			entry_name != "."
+			and entry_name != ".."
+			and not entry_name.begins_with(".")
+		):
+			if dir.current_is_dir():
+				if entry_name != SELF_ADDON_FOLDER:
+					raw_entries.append_array(
+						_collect_entries_from_directory(
+							global_path.path_join(entry_name)
+						)
+					)
+			elif entry_name.get_extension().to_lower() == ZIP_EXTENSION:
+				raw_entries.append_array(
+					_collect_entries_from_zip(
+						global_path.path_join(entry_name)
+					)
+				)
+
+		entry_name = dir.get_next()
+
+	dir.list_dir_end()
+
+	var latest_entries := _select_latest_addon_entries(raw_entries)
+	latest_entries.sort_custom(
+		func(a: Dictionary, b: Dictionary) -> bool:
+			return (
+				_get_entry_display_name(a).naturalnocasecmp_to(
+					_get_entry_display_name(b)
+				) < 0
+			)
+	)
+	return latest_entries
+
+
+# --- Real directories ---------------------------------------------------
+
+
+func _collect_entries_from_directory(
+	top_level_path: String
+) -> Array[Dictionary]:
+	return _scan_directory_for_addon_entries(
+		top_level_path,
+		top_level_path,
+		0
+	)
+
+
+func _scan_directory_for_addon_entries(
+	directory_path: String,
+	top_level_path: String,
+	depth: int
+) -> Array[Dictionary]:
+	var normalized_path := _normalize_absolute_path(directory_path)
+	var entries: Array[Dictionary] = []
+
+	if _directory_has_direct_addon_marker(normalized_path):
+		var addon_type := _get_addon_type(normalized_path)
+
+		if addon_type != AddonType.UNKNOWN:
+			var git_repo_root := _find_git_repo_root(
+				normalized_path,
+				top_level_path
+			)
+			var git_remote_url := (
+				_read_git_remote_url(git_repo_root)
+				if git_repo_root != "" else ""
+			)
+
+			entries.append(
+				_build_dir_addon_entry(
+					normalized_path,
+					addon_type,
+					git_remote_url,
+					git_repo_root
+				)
+			)
+
+		return entries
+
+	if depth >= MAX_ADDON_ROOT_SEARCH_DEPTH:
+		return entries
+
+	var dir := DirAccess.open(normalized_path)
+
+	if dir == null:
+		return entries
+
+	var child_directories: Array[String] = []
+	dir.list_dir_begin()
+	var entry_name := dir.get_next()
+
+	while entry_name != "":
+		if entry_name != "." and entry_name != "..":
+			if dir.current_is_dir():
+				if _should_search_addon_directory(entry_name):
+					child_directories.append(
+						normalized_path.path_join(entry_name)
+					)
+			elif (
+				not entry_name.begins_with(".")
+				and entry_name.get_extension().to_lower() == ZIP_EXTENSION
+			):
+				entries.append_array(
+					_collect_entries_from_zip(
+						normalized_path.path_join(entry_name)
+					)
+				)
+
+		entry_name = dir.get_next()
+
+	dir.list_dir_end()
+
+	for child_directory in child_directories:
+		entries.append_array(
+			_scan_directory_for_addon_entries(
+				child_directory,
+				top_level_path,
+				depth + 1
+			)
+		)
+
+	return entries
+
+
+func _directory_has_direct_addon_marker(
+	directory_path: String
+) -> bool:
+	if FileAccess.file_exists(directory_path.path_join("plugin.cfg")):
+		return true
+
+	var dir := DirAccess.open(directory_path)
+
+	if dir == null:
+		return false
+
+	dir.list_dir_begin()
+	var entry_name := dir.get_next()
+	var found_gdextension := false
+
+	while entry_name != "":
+		if (
+			entry_name != "."
+			and entry_name != ".."
+			and not dir.current_is_dir()
+			and entry_name.get_extension().to_lower() == "gdextension"
+		):
+			found_gdextension = true
+			break
+
+		entry_name = dir.get_next()
+
+	dir.list_dir_end()
+	return found_gdextension
+
+
+func _build_dir_addon_entry(
+	root_path: String,
+	addon_type: int,
+	git_remote_url: String,
+	git_repo_root: String
+) -> Dictionary:
+	var normalized_root := _normalize_absolute_path(root_path)
+	var folder_name := normalized_root.get_file()
+
+	return {
+		"id": "dir::%s" % normalized_root,
+		"source_type": SourceType.DIR,
+		"root_path": normalized_root,
+		"archive_path": "",
+		"internal_root": "",
+		"target_folder_name": folder_name,
+		"name": _get_addon_name(normalized_root, folder_name),
+		"version": _get_addon_version(normalized_root),
+		"description": _get_addon_description(normalized_root),
+		"type": addon_type,
+		"git_remote_url": git_remote_url,
+		"git_repo_root": git_repo_root,
+	}
+
+
+# --- ZIP archives ---------------------------------------------------------
+
+
+func _collect_entries_from_zip(
+	archive_path: String
+) -> Array[Dictionary]:
+	var entries: Array[Dictionary] = []
+	var reader := ZIPReader.new()
+
+	if reader.open(archive_path) != OK:
+		return entries
+
+	var files := reader.get_files()
+	var roots := _find_zip_addon_roots(files)
+
+	for internal_root in roots:
+		var addon_type := _get_zip_addon_type(
+			files,
+			internal_root
+		)
+
+		if addon_type == AddonType.UNKNOWN:
+			continue
+
+		entries.append(
+			_build_zip_addon_entry(
+				reader,
+				files,
+				archive_path,
+				internal_root,
+				addon_type
+			)
+		)
+
+	reader.close()
+	return entries
+
+
+func _find_zip_addon_roots(files: PackedStringArray) -> Array[String]:
+	var candidate_set := {}
+
+	for file_path in files:
+		if file_path.ends_with("/"):
+			continue
+
+		var file_name := file_path.get_file()
+		var is_plugin_cfg := file_name == "plugin.cfg"
+		var is_gdextension := (
+			file_name.get_extension().to_lower() == "gdextension"
+		)
+
+		if not is_plugin_cfg and not is_gdextension:
+			continue
+
+		var dir_path := file_path.get_base_dir()
+
+		if _zip_path_should_be_ignored(dir_path):
+			continue
+
+		candidate_set[dir_path] = true
+
+	var candidates: Array = candidate_set.keys()
+	candidates.sort_custom(
+		func(a: String, b: String) -> bool:
+			return a.length() < b.length()
+	)
+
+	var roots: Array[String] = []
+
+	for candidate in candidates:
+		var is_nested := false
+
+		for accepted in roots:
+			if candidate == accepted or accepted == "":
+				is_nested = true
+				break
+
+			if candidate.begins_with(accepted + "/"):
+				is_nested = true
+				break
+
+		if not is_nested:
+			roots.append(candidate)
+
+	return roots
+
+
+func _zip_path_should_be_ignored(dir_path: String) -> bool:
+	if dir_path == "":
+		return false
+
+	for segment in dir_path.split("/"):
+		if not _should_search_addon_directory(segment):
+			return true
+
+	return false
+
+
+func _zip_subtree_has_gdextension(
+	files: PackedStringArray,
+	internal_root: String
+) -> bool:
+	var prefix := internal_root + "/" if internal_root != "" else ""
+
+	for file_path in files:
+		if file_path.ends_with("/"):
+			continue
+
+		if prefix != "" and not file_path.begins_with(prefix):
+			continue
+
+		var relative_path := (
+			file_path.substr(prefix.length()) if prefix != "" else file_path
+		)
+
+		if _zip_path_should_be_ignored(relative_path.get_base_dir()):
+			continue
+
+		if relative_path.get_extension().to_lower() == "gdextension":
+			return true
+
+	return false
+
+
+func _get_zip_addon_type(
+	files: PackedStringArray,
+	internal_root: String
+) -> int:
+	var plugin_cfg_path := (
+		"plugin.cfg" if internal_root == ""
+		else internal_root.path_join("plugin.cfg")
+	)
+	var has_plugin_cfg := files.has(plugin_cfg_path)
+	var has_gdextension := _zip_subtree_has_gdextension(
+		files,
+		internal_root
+	)
+
+	if has_plugin_cfg and has_gdextension:
+		return AddonType.HYBRID
+	elif has_plugin_cfg:
+		return AddonType.EDITOR_PLUGIN
+	elif has_gdextension:
+		return AddonType.GDEXTENSION
+
+	return AddonType.UNKNOWN
+
+
+func _build_zip_addon_entry(
+	reader: ZIPReader,
+	files: PackedStringArray,
+	archive_path: String,
+	internal_root: String,
+	addon_type: int
+) -> Dictionary:
+	var folder_name := (
+		internal_root.get_file() if internal_root != ""
+		else archive_path.get_file().get_basename()
+	)
+	var plugin_cfg_path := (
+		"plugin.cfg" if internal_root == ""
+		else internal_root.path_join("plugin.cfg")
+	)
+	var addon_name := folder_name
+	var addon_version := ""
+	var addon_description := ""
+
+	if files.has(plugin_cfg_path):
+		var raw_bytes := reader.read_file(plugin_cfg_path)
+		var config := ConfigFile.new()
+
+		if config.parse(raw_bytes.get_string_from_utf8()) == OK:
+			addon_name = str(
+				config.get_value("plugin", "name", folder_name)
+			)
+			addon_version = str(
+				config.get_value("plugin", "version", "")
+			)
+			addon_description = str(
+				config.get_value("plugin", "description", "")
+			)
+
+	return {
+		"id": "zip::%s::%s" % [archive_path, internal_root],
+		"source_type": SourceType.ZIP,
+		"root_path": "",
+		"archive_path": archive_path,
+		"internal_root": internal_root,
+		"target_folder_name": folder_name,
+		"name": addon_name,
+		"version": addon_version,
+		"description": addon_description,
+		"type": addon_type,
+		"git_remote_url": "",
+		"git_repo_root": "",
+	}
+
+
+# --- Version resolution -----------------------------------------------------
+
+
+func _select_latest_addon_entries(
+	entries: Array[Dictionary]
+) -> Array[Dictionary]:
+	var best_by_name := {}
+
+	for entry in entries:
+		var key: String = entry.name.strip_edges().to_lower()
+
+		if key == "":
+			key = str(entry.target_folder_name).to_lower()
+
+		if not best_by_name.has(key):
+			best_by_name[key] = entry
+			continue
+
+		var current: Dictionary = best_by_name[key]
+		var comparison := _compare_version_strings(
+			entry.version,
+			current.version
+		)
+
+		if comparison > 0:
+			best_by_name[key] = entry
+		elif (
+			comparison == 0
+			and current.source_type == SourceType.ZIP
+			and entry.source_type == SourceType.DIR
+		):
+			best_by_name[key] = entry
+
+	var result: Array[Dictionary] = []
+
+	for key in best_by_name:
+		result.append(best_by_name[key])
+
+	return result
+
+
+func _compare_version_strings(a: String, b: String) -> int:
+	if a == b:
+		return 0
+
+	if a == "":
+		return -1
+
+	if b == "":
+		return 1
+
+	var parts_a := a.split(".")
+	var parts_b := b.split(".")
+	var max_length := max(parts_a.size(), parts_b.size())
+
+	for i in range(max_length):
+		var part_a := parts_a[i] if i < parts_a.size() else "0"
+		var part_b := parts_b[i] if i < parts_b.size() else "0"
+		var value_a := int(part_a) if part_a.is_valid_int() else 0
+		var value_b := int(part_b) if part_b.is_valid_int() else 0
+
+		if value_a != value_b:
+			return 1 if value_a > value_b else -1
+
+	if a > b:
+		return 1
+	elif a < b:
+		return -1
+
+	return 0
+
+
+# --- Git metadata -----------------------------------------------------------
+
+
+func _find_git_repo_root(
+	start_path: String,
+	boundary_path: String
+) -> String:
+	var normalized_boundary := _normalize_absolute_path(boundary_path)
+	var current_path := _normalize_absolute_path(start_path)
+
+	while (
+		current_path == normalized_boundary
+		or current_path.begins_with(normalized_boundary + "/")
+	):
+		if DirAccess.dir_exists_absolute(
+			current_path.path_join(GIT_DIRECTORY_NAME)
+		):
+			return current_path
+
+		if current_path == normalized_boundary:
+			break
+
+		current_path = current_path.get_base_dir()
+
+	return ""
+
+
+func _read_git_remote_url(directory_path: String) -> String:
+	var git_config_path := directory_path.path_join(
+		GIT_DIRECTORY_NAME
+	).path_join(GIT_CONFIG_FILE_NAME)
+
+	if not FileAccess.file_exists(git_config_path):
+		return ""
+
+	var file := FileAccess.open(git_config_path, FileAccess.READ)
+
+	if file == null:
+		return ""
+
+	var in_origin_section := false
+	var fallback_url := ""
+
+	while not file.eof_reached():
+		var line := file.get_line().strip_edges()
+
+		if line.begins_with("[") and line.ends_with("]"):
+			in_origin_section = (
+				line.to_lower().begins_with('[remote "origin"]')
+			)
+			continue
+
+		if line.begins_with("url") and line.contains("="):
+			var value := line.split("=", true, 1)[1].strip_edges()
+
+			if in_origin_section:
+				file.close()
+				return value
+			elif fallback_url == "":
+				fallback_url = value
+
+	file.close()
+	return fallback_url
+
+
+func _convert_git_url_to_browser_url(git_remote_url: String) -> String:
+	var url := git_remote_url.strip_edges()
+
+	if url == "":
+		return ""
+
+	if url.begins_with("git://"):
+		url = "https://" + url.substr(6)
+	elif url.begins_with("ssh://"):
+		url = "https://" + url.substr(6).trim_prefix("git@")
+	elif not url.begins_with("http://") and not url.begins_with("https://"):
+		var scp_pattern := RegEx.new()
+		scp_pattern.compile("^[^@/]+@([^:]+):(.+)$")
+		var match_result := scp_pattern.search(url)
+
+		if match_result != null:
+			url = "https://%s/%s" % [
+				match_result.get_string(1),
+				match_result.get_string(2),
+			]
+
+	if url.ends_with(".git"):
+		url = url.substr(0, url.length() - 4)
+
+	return url
+
+
+func _get_global_addon_tooltip_text(entry: Dictionary) -> String:
+	var lines: Array[String] = []
+
+	if entry.source_type == SourceType.ZIP:
+		lines.append("Archive: %s" % entry.archive_path)
+
+		if entry.internal_root != "":
+			lines.append("Path in archive: %s" % entry.internal_root)
+	else:
+		lines.append("Path: %s" % entry.root_path)
+
+	if entry.git_remote_url != "":
+		lines.append("Git remote: %s" % entry.git_remote_url)
+
+	return "\n".join(lines)
+
+
+func _get_project_addon_tooltip_text(addon_path: String) -> String:
+	var lines: Array[String] = ["Path: %s" % addon_path]
+	var git_remote_url := _read_git_remote_url(addon_path)
+
+	if git_remote_url != "":
+		lines.append("Git remote: %s" % git_remote_url)
+
+	return "\n".join(lines)
+
+
+# --- Git pull -----------------------------------------------------------
+
+
+func _pull_all_global_git_addons() -> void:
+	if global_addon_entries.is_empty():
+		_set_status("The global library has no addons to check.")
+		return
+
+	var entries_by_repo := {}
+
+	for entry in global_addon_entries:
+		if (
+			entry.source_type == SourceType.DIR
+			and entry.git_repo_root != ""
+		):
+			var repo_root: String = entry.git_repo_root
+
+			if not entries_by_repo.has(repo_root):
+				entries_by_repo[repo_root] = []
+
+			entries_by_repo[repo_root].append(entry)
+
+	if entries_by_repo.is_empty():
+		_set_status("No global addon is tracked as a git checkout.")
+		return
+
+	var updated_messages: Array[String] = []
+	var failed_messages: Array[String] = []
+	var unchanged_count := 0
+
+	for repo_root in entries_by_repo:
+		var repo_entries: Array = entries_by_repo[repo_root]
+		var versions_before := {}
+
+		for entry in repo_entries:
+			versions_before[entry.id] = entry.version
+
+		var pull_result := _run_git_pull(repo_root)
+
+		if not pull_result.success:
+			failed_messages.append(
+				"%s (%s)"
+				% [
+					repo_root.get_file(),
+					str(pull_result.output).strip_edges(),
+				]
+			)
+			continue
+
+		var repo_updated := false
+
+		for entry in repo_entries:
+			var new_version := _get_addon_version(entry.root_path)
+			var old_version: String = versions_before[entry.id]
+
+			if _compare_version_strings(new_version, old_version) > 0:
+				updated_messages.append(
+					"%s %s → %s" % [entry.name, old_version, new_version]
+				)
+				repo_updated = true
+
+		if not repo_updated:
+			unchanged_count += 1
+
+	_refresh_all(false)
+
+	var summary_parts: Array[String] = []
+
+	if not updated_messages.is_empty():
+		summary_parts.append(
+			"New version available: %s" % ", ".join(updated_messages)
+		)
+
+	if unchanged_count > 0:
+		summary_parts.append(
+			"%d repositor%s already up to date."
+			% [unchanged_count, "y" if unchanged_count == 1 else "ies"]
+		)
+
+	if not failed_messages.is_empty():
+		summary_parts.append(
+			"Failed to pull %d repositor%s: %s"
+			% [
+				failed_messages.size(),
+				"y" if failed_messages.size() == 1 else "ies",
+				"; ".join(failed_messages),
+			]
+		)
+
+	if summary_parts.is_empty():
+		_set_status("git pull finished with no changes.")
+	else:
+		_set_status(" | ".join(summary_parts))
+
+
+func _run_git_pull(repo_root: String) -> Dictionary:
+	var output: Array = []
+	var exit_code := OS.execute(
+		"git",
+		["-C", repo_root, "pull", "--ff-only"],
+		output,
+		true
+	)
+
+	if exit_code == -1:
+		return {
+			"success": false,
+			"output": "git executable not found.",
+		}
+
+	var output_text := ""
+
+	if output.size() > 0:
+		output_text = str(output[0])
+
+	return {
+		"success": exit_code == 0,
+		"output": output_text,
+	}
 
 
 # ==============================================================================
@@ -1413,7 +2267,7 @@ func _find_gdextension_descriptor(
 			var entry_path := normalized_path.path_join(entry_name)
 
 			if dir.current_is_dir():
-				if _should_search_gdextension_directory(entry_name):
+				if _should_search_addon_directory(entry_name):
 					child_directories.append(entry_path)
 			elif entry_name.get_extension().to_lower() == "gdextension":
 				dir.list_dir_end()
@@ -1445,13 +2299,13 @@ func _find_gdextension_descriptor(
 	return ""
 
 
-func _should_search_gdextension_directory(
+func _should_search_addon_directory(
 	directory_name: String
 ) -> bool:
 	if directory_name.begins_with("."):
 		return false
 
-	return not GDEXTENSION_SEARCH_IGNORED_FOLDERS.has(
+	return not ADDON_SEARCH_IGNORED_FOLDERS.has(
 		directory_name.to_lower()
 	)
 
@@ -1544,10 +2398,12 @@ func _toggle_selected_project_plugin() -> void:
 
 
 func _copy_selected_global_to_project() -> void:
-	var addon_folder := _get_selected_global_addon_folder()
+	var entry := _get_selected_global_addon_entry()
 
-	if addon_folder == "":
+	if entry.is_empty():
 		return
+
+	var addon_folder: String = entry.target_folder_name
 
 	if _is_project_addon_installed(addon_folder):
 		_set_status(
@@ -1555,13 +2411,12 @@ func _copy_selected_global_to_project() -> void:
 		)
 		return
 
-	var source_path := _get_global_path().path_join(addon_folder)
 	var target_path := _get_project_addon_absolute_path(
 		addon_folder
 	)
-	var addon_type := _get_addon_type(source_path)
-	var copy_error := _copy_addon_folder(
-		source_path,
+	var addon_type: int = entry.type
+	var copy_error := _copy_addon_entry_to_path(
+		entry,
 		target_path,
 		false
 	)
@@ -1573,7 +2428,6 @@ func _copy_selected_global_to_project() -> void:
 		)
 		return
 
-	selected_global_addon_folder = addon_folder
 	selected_project_addon_folder = addon_folder
 
 	_scan_editor_filesystem()
@@ -1642,7 +2496,9 @@ func _copy_selected_project_to_global() -> void:
 		)
 		return
 
-	selected_global_addon_folder = addon_folder
+	selected_global_addon_entry = {
+		"id": "dir::%s" % _normalize_absolute_path(target_path)
+	}
 	selected_project_addon_folder = addon_folder
 	_refresh_all(false)
 	_set_status("Added %s to the global library." % addon_folder)
@@ -1654,10 +2510,12 @@ func _copy_selected_project_to_global() -> void:
 
 
 func _request_overwrite_project() -> void:
-	var addon_folder := _get_selected_global_addon_folder()
+	var entry := _get_selected_global_addon_entry()
 
-	if addon_folder == "":
+	if entry.is_empty():
 		return
+
+	var addon_folder: String = entry.target_folder_name
 
 	if not _is_project_addon_installed(addon_folder):
 		_set_status("The addon is not installed in this project.")
@@ -1678,7 +2536,7 @@ func _request_overwrite_project() -> void:
 		return
 
 	pending_action = PendingAction.OVERWRITE_PROJECT
-	pending_addon_folder = addon_folder
+	pending_global_entry = entry
 	confirmation_dialog.title = "Update Project Addon"
 	confirmation_dialog.dialog_text = (
 		"Replace the project copy of '%s' with the global version?\n\n"
@@ -1741,7 +2599,7 @@ func _request_remove_project_addon() -> void:
 func _on_confirmation_accepted() -> void:
 	match pending_action:
 		PendingAction.OVERWRITE_PROJECT:
-			_overwrite_project_from_global(pending_addon_folder)
+			_overwrite_project_from_global(pending_global_entry)
 		PendingAction.OVERWRITE_GLOBAL:
 			_overwrite_global_from_project(pending_addon_folder)
 		PendingAction.REMOVE_PROJECT:
@@ -1753,14 +2611,16 @@ func _on_confirmation_accepted() -> void:
 func _clear_pending_action() -> void:
 	pending_action = PendingAction.NONE
 	pending_addon_folder = ""
+	pending_global_entry = {}
 
 
 func _overwrite_project_from_global(
-	addon_folder: String
+	entry: Dictionary
 ) -> void:
-	if addon_folder == "":
+	if entry.is_empty():
 		return
 
+	var addon_folder: String = entry.target_folder_name
 	var project_path := _get_project_addon_absolute_path(
 		addon_folder
 	)
@@ -1773,9 +2633,8 @@ func _overwrite_project_from_global(
 		_set_status("Disable the editor plugin before updating it.")
 		return
 
-	var source_path := _get_global_path().path_join(addon_folder)
-	var copy_error := _copy_addon_folder(
-		source_path,
+	var copy_error := _copy_addon_entry_to_path(
+		entry,
 		project_path,
 		true
 	)
@@ -1789,7 +2648,6 @@ func _overwrite_project_from_global(
 		)
 		return
 
-	selected_global_addon_folder = addon_folder
 	selected_project_addon_folder = addon_folder
 	_scan_editor_filesystem()
 	_refresh_all(false)
@@ -1824,7 +2682,9 @@ func _overwrite_global_from_project(
 		)
 		return
 
-	selected_global_addon_folder = addon_folder
+	selected_global_addon_entry = {
+		"id": "dir::%s" % _normalize_absolute_path(target_path)
+	}
 	selected_project_addon_folder = addon_folder
 	_refresh_all(false)
 	_set_status("Updated the global copy of %s." % addon_folder)
@@ -1886,6 +2746,119 @@ func _copy_addon_folder(
 	if _get_addon_type(normalized_source) == AddonType.UNKNOWN:
 		return ERR_FILE_UNRECOGNIZED
 
+	return _commit_addon_to_target(
+		func(temporary_path: String) -> Error:
+			return _copy_dir_recursive(normalized_source, temporary_path),
+		normalized_target,
+		overwrite_existing
+	)
+
+
+func _extract_addon_from_zip(
+	archive_path: String,
+	internal_root: String,
+	target_path: String,
+	overwrite_existing: bool
+) -> Error:
+	var normalized_target := _normalize_absolute_path(target_path)
+
+	return _commit_addon_to_target(
+		func(temporary_path: String) -> Error:
+			return _extract_zip_subtree(
+				archive_path,
+				internal_root,
+				temporary_path
+			),
+		normalized_target,
+		overwrite_existing
+	)
+
+
+func _copy_addon_entry_to_path(
+	entry: Dictionary,
+	target_path: String,
+	overwrite_existing: bool
+) -> Error:
+	if entry.source_type == SourceType.ZIP:
+		return _extract_addon_from_zip(
+			entry.archive_path,
+			entry.internal_root,
+			target_path,
+			overwrite_existing
+		)
+
+	return _copy_addon_folder(
+		entry.root_path,
+		target_path,
+		overwrite_existing
+	)
+
+
+func _extract_zip_subtree(
+	archive_path: String,
+	internal_root: String,
+	target_path: String
+) -> Error:
+	var reader := ZIPReader.new()
+	var open_error := reader.open(archive_path)
+
+	if open_error != OK:
+		return open_error
+
+	var files := reader.get_files()
+	var prefix := internal_root + "/" if internal_root != "" else ""
+	var extracted_any := false
+
+	for file_path in files:
+		if file_path.ends_with("/"):
+			continue
+
+		if prefix != "" and not file_path.begins_with(prefix):
+			continue
+
+		var relative_path := (
+			file_path.substr(prefix.length()) if prefix != "" else file_path
+		)
+
+		if relative_path == "":
+			continue
+
+		var destination_path := target_path.path_join(relative_path)
+		var create_dir_error := DirAccess.make_dir_recursive_absolute(
+			destination_path.get_base_dir()
+		)
+
+		if create_dir_error != OK:
+			reader.close()
+			return create_dir_error
+
+		var file_bytes := reader.read_file(file_path)
+		var file_handle := FileAccess.open(
+			destination_path,
+			FileAccess.WRITE
+		)
+
+		if file_handle == null:
+			reader.close()
+			return FileAccess.get_open_error()
+
+		file_handle.store_buffer(file_bytes)
+		file_handle.close()
+		extracted_any = true
+
+	reader.close()
+
+	if not extracted_any:
+		return ERR_FILE_UNRECOGNIZED
+
+	return OK
+
+
+func _commit_addon_to_target(
+	populate_temporary_path: Callable,
+	normalized_target: String,
+	overwrite_existing: bool
+) -> Error:
 	var target_exists := DirAccess.dir_exists_absolute(
 		normalized_target
 	)
@@ -1910,14 +2883,13 @@ func _copy_addon_folder(
 		"backup"
 	)
 
-	var copy_error := _copy_dir_recursive(
-		normalized_source,
+	var populate_error: Error = populate_temporary_path.call(
 		temporary_path
 	)
 
-	if copy_error != OK:
+	if populate_error != OK:
 		_cleanup_directory_best_effort(temporary_path)
-		return copy_error
+		return populate_error
 
 	_clear_addon_detection_cache()
 
@@ -2172,12 +3144,27 @@ func _get_addon_version(addon_path: String) -> String:
 	return str(config.get_value("plugin", "version", ""))
 
 
-func _get_selected_global_addon_folder() -> String:
-	if selected_global_addon_folder != "":
-		return selected_global_addon_folder
+func _get_addon_description(addon_path: String) -> String:
+	var plugin_config_path := addon_path.path_join("plugin.cfg")
+
+	if not FileAccess.file_exists(plugin_config_path):
+		return ""
+
+	var config := ConfigFile.new()
+	var load_error := config.load(plugin_config_path)
+
+	if load_error != OK:
+		return ""
+
+	return str(config.get_value("plugin", "description", ""))
+
+
+func _get_selected_global_addon_entry() -> Dictionary:
+	if not selected_global_addon_entry.is_empty():
+		return selected_global_addon_entry
 
 	_set_status("Select a global addon first.")
-	return ""
+	return {}
 
 
 func _get_selected_project_addon_folder() -> String:
@@ -2199,14 +3186,11 @@ func _is_project_addon_installed(
 func _is_global_addon_installed(
 	addon_folder: String
 ) -> bool:
-	var global_path := _get_global_path()
+	for entry in global_addon_entries:
+		if entry.target_folder_name == addon_folder:
+			return true
 
-	if global_path == "":
-		return false
-
-	return DirAccess.dir_exists_absolute(
-		global_path.path_join(addon_folder)
-	)
+	return false
 
 
 # ==============================================================================
